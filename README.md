@@ -66,6 +66,7 @@ The function is triggered by an SNS event when a user sends an SMS to a designat
 
 ### Event Format
 A sample SNS event for testing is provided in `events/subscribed_user_test.json`:
+```
 {
   "Records": [
     {
@@ -77,7 +78,7 @@ A sample SNS event for testing is provided in `events/subscribed_user_test.json`
     }
   ]
 }
-
+```
 ### Functionality
 - **Keyword Processing**: Handles `STOP`, `HELP`, and `JOIN` commands without querying the AI API.
 - **Authorization**: Checks if the user is verified in Cognito and has an active subscription in DynamoDB.
@@ -111,7 +112,7 @@ The function interacts with a DynamoDB table (specified by `DYNAMODB_TABLE_NAME`
 - **Error Handling**: Robust try-except blocks to prevent crashes and logging errors to analyze any crashes that occur.
 
 ## License
-This project is provided under a restricted license for viewing purposes only. Unauthorized use, modification, distribution, or deployment of this code is prohibited. For permissions or licensing inquiries, please contact the repository owner.
+This project is provided under a [restricted license](https://github.com/jcswanson/tisi-sms-service?tab=License-1-ov-file) for viewing purposes only. Unauthorized use, modification, distribution, or deployment of this code is prohibited. For permissions or licensing inquiries, please contact the repository owner.
 
 ## Support
 For questions or inquiries about code:
