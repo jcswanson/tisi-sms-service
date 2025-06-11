@@ -1,4 +1,5 @@
-# Text It Search It SMS AI Search AWS Lambda 
+# Text It Search It 
+## A SMS Search Service Using AWS Lambda, DynamoDB, Cognito, and SNS
 This AWS Lambda function powers the core functionality of **Text It Search It (Tisi)**, an SMS-based AI search service. It processes incoming SMS messages from users, handles specific keywords (like STOP, HELP, JOIN) complying with international SMS messaging poliicies, authorizes users by seeing if they're phone numbers are verified via AWS Cognito, queries the Perplexity.ai Sonar API for responses, and sends answers back via SMS using AWS SNS. The function ensures user privacy and subscription management with DynamoDB integration only holding the details needed to provide a search service and not storing the users' queries or the responses they receive from the AI.
 
 ## Overview
