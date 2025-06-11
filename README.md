@@ -29,7 +29,7 @@ sequenceDiagram
     P->>S2: Send Response via SMS
 ```
 ## File Structure
-
+```
 tisi-sms-search-service/
 ├── src/
 │ └── lambda_function.py # Main Lambda function 
@@ -38,7 +38,7 @@ tisi-sms-search-service/
 │ └── unsubscribed_user_test.json # Sample SNS event for testing the denial of unsubscribed userbase
 ├── request_layer.zip # Python dependency that imports re pip package to AWS Layer
 └── README.md # This documentation file
-
+```
 ## Requirements
 
 - **AWS CLI**: Configured with appropriate permissions.
