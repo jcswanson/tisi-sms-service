@@ -1,6 +1,6 @@
 Tisi (Text It Search It) License
 
-Copyright (c) 2025 John Swanson. All rights reserved.
+Copyright (c) 2025 Text It Search It. All rights reserved.
 
 This repository is made public for viewing purposes only. The software and its source code are proprietary and confidential, protected under United States copyright law and international treaties. No rights are granted to use, copy, modify, merge, publish, distribute, sublicense, sell, or otherwise exploit the software or any part thereof without the explicit written permission of John Swanson.
 
