@@ -33,7 +33,7 @@ sequenceDiagram
 tisi-sms-search-service/
 ├── src/
 │ └── lambda_function.py # Main Lambda function 
-├── events/
+├── lambda-tests/
 │ └── subscribed_user_test.json # Sample SNS event for testing the SMS sending to subscribed userbase
 │ └── unsubscribed_user_test.json # Sample SNS event for testing the denial of unsubscribed userbase
 ├── request_layer.zip # Python dependency that imports re pip package to AWS Layer
@@ -65,7 +65,7 @@ This code is provided for viewing purposes only under a restricted license. For 
 The function is triggered by an SNS event when a user sends an SMS to a designated Tisi phone number.
 
 ### Event Format
-A sample SNS event for testing is provided in `events/subscribed_user_test.json`:
+A sample SNS json event for testing is provided in `lambda-tests/subscribed_user_test.json`:
 ```
 {
   "Records": [
@@ -78,6 +78,29 @@ A sample SNS event for testing is provided in `events/subscribed_user_test.json`
     }
   ]
 }
+```
+**Successful Reponse:**
+```
+Status: Succeeded
+Test Event Name: subscribed_user_test
+
+Response:
+{
+  "statusCode": 200,
+  "body": "\"Message processed successfully\""
+}
+
+Function Logs:
+
+[INFO]	2025-06-11T02:00:37.565Z	dc5d5ac7-dc2c-4e46-a6ad-d89e88b21191	Perplexity API response status: 200
+[INFO]	2025-06-11T02:00:37.566Z	dc5d5ac7-dc2c-4e46-a6ad-d89e88b21191	Perplexity API response content: {"id": "b5d1dac8-2be3-47bf-8e18-e7827e93790c", "model": "sonar", "created": 1749607237, "usage": {"prompt_tokens": 34, "completion_tokens": 60, "total_tokens": 94, "search_context_size": "low"}, "message": {"role": "assistant", "content": "The rosary's roots date back thousands of years, with prayer beads used in ancient times. The modern rosary form developed between the 12th and 16th centuries. The name \"rosary\" was first recorded in 1597, but its origins are tied to earlier prayer practices."}, "delta": {"role": "assistant", "content": ""}}
+[INFO]	2025-06-11T02:00:37.566Z	dc5d5ac7-dc2c-4e46-a6ad-d89e88b21191	Perplexity API response: The rosary's roots date back thousands of years, with prayer beads used in ancient times. The modern rosary form developed between the 12th and 16th centuries. The name "rosary" was first recorded in 1597, but its origins are tied to earlier prayer practices.
+[INFO]	2025-06-11T02:00:37.566Z	dc5d5ac7-dc2c-4e46-a6ad-d89e88b21191	Cleaned response: The rosary's roots date back thousands of years, with prayer beads used in ancient times. The modern rosary form developed between the 12th and 16th centuries. The name "rosary" was first recorded in 1597, but its origins are tied to earlier prayer practices.
+[INFO]	2025-06-11T02:00:37.566Z	dc5d5ac7-dc2c-4e46-a6ad-d89e88b21191	Attempting to send SMS to +1234567890 from +13456175743
+[INFO]	2025-06-11T02:00:37.604Z	dc5d5ac7-dc2c-4e46-a6ad-d89e88b21191	SMS sent successfully from +13456175743. MessageId: 11bcd612-a982-5a4f-89b2-b6d04c07a5f2
+[INFO]	2025-06-11T02:00:37.604Z	dc5d5ac7-dc2c-4e46-a6ad-d89e88b21191	Message processed successfully
+[INFO]	2025-06-11T02:00:37.604Z	dc5d5ac7-dc2c-4e46-a6ad-d89e88b21191	Lambda function execution completed
+END RequestId: dc5d5ac7-dc2c-4e46-a6ad-d89e88b21191
 ```
 ### Functionality
 - **Keyword Processing**: Handles `STOP`, `HELP`, and `JOIN` commands without querying the AI API.
@@ -97,7 +120,7 @@ A sample SNS event for testing is provided in `events/subscribed_user_test.json`
 The function interacts with a DynamoDB table (specified by `DYNAMODB_TABLE_NAME`) with the following key attributes:
 - `id` (String): Primary key for user records.
 - `cognitoId` (String): Maps to Cognito user’s `sub` attribute.
-- `subscriptionStatus` (String): User’s subscription state (`active`, `stopped`).
+- `subscriptionStatus` (String): User’s subscription state (`active`, `inactive`, 'cancelled').
 - `servicePhoneNumber` (String, optional): Assigned Tisi service number for the user.
 
 ## Error Handling
