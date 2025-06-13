@@ -139,7 +139,7 @@ The function interacts with a DynamoDB table (specified by `DYNAMODB_TABLE_NAME`
 This project is provided under a [restricted license](https://github.com/jcswanson/tisi-sms-service?tab=License-1-ov-file) for viewing purposes only. Unauthorized use, modification, distribution, or deployment of this code is prohibited. For permissions or licensing inquiries, please contact the repository owner.
 
 ## Support
-For questions or inquiries about the code or service email the Text It Search It developer and founder [John Swanson](mailto:john@textitsearchit.com)
+- For questions or inquiries about the code or service email the Text It Search It developer and founder [John Swanson](mailto:john@textitsearchit.com)
 ---
 **Last Updated**: June 10, 2025  
 **Version**: 1.0.2  
