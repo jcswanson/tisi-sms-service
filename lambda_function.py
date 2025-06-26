@@ -1,6 +1,6 @@
-# TISI | Version 10 | @jcswanson
-# - Multi-lined Perplexity prompt with sentence limitation
-# - Logging of Perplexity tokens
+# Text It Search It | Version 11 | jcswanson
+# - New Perplexity prompt with Sentence truncation to avoid cut off sentences
+# - Same method from Demo on the website
 
 import json
 import os
@@ -176,6 +176,7 @@ def handle_keywords(message_body: str, phone_number: str) -> bool:
     return False
 
 def query_perplexity(query: str, transaction_id: str) -> str:
+    """Enhanced Perplexity API call with improved prompting and response handling"""
     headers = {
         "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
         "Content-Type": "application/json"
@@ -186,12 +187,16 @@ def query_perplexity(query: str, transaction_id: str) -> str:
             {
                 "role": "system",
                 "content": (
-                    "You are a real-time search engine for SMS. "
-                    "Provide a single, concise, and accurate answer to the user using no more than 280 characters. "
-                    "You're answer should NOT be more than 5 complete sentences. "
-                    "Make sure your answer's final sentence is complete and never cut short."
-                    "The answer should contain the most current information available. "
-                    "Do not use Markdown formatting, citations, or any extra text beyond the answer itself."
+                    "You are a real-time search engine for SMS responses. "
+                    "CRITICAL CONSTRAINTS: "
+                    "- Aim for responses around 400 characters but prioritize complete sentences over strict length limits "
+                    "- Use exactly 4-5 complete sentences maximum "
+                    "- Each sentence MUST be fully complete with proper punctuation "
+                    "- Never end mid-sentence - complete sentences are more important than character limits "
+                    "- Prioritize the most important information first "
+                    "- Use simple, direct language without unnecessary words "
+                    "- Do not use Markdown, citations, or formatting "
+                    "- If the answer requires more space for complete sentences, that is acceptable"
                 )
             },
             {
@@ -202,9 +207,9 @@ def query_perplexity(query: str, transaction_id: str) -> str:
         "web_search_options": {
             "search_context_size": "medium"
         },
-        "max_tokens": 400,  # Increased to ensure complete answers up to 280 characters
-        "temperature": 0.3,  # Slightly increased for more complete responses while maintaining focus
-        "top_p": 0.7  # Reduced to focus on more probable tokens for relevance
+        "max_tokens": 280,  # Optimized for complete sentences within SMS constraints
+        "temperature": 0.2,  # Lower temperature for more focused responses
+        "top_p": 0.7
     }
     start_time = time.time()
     try:
@@ -240,7 +245,10 @@ def query_perplexity(query: str, transaction_id: str) -> str:
         })
         
         if response.status == 200:
-            return result['choices'][0]['message']['content']
+            raw_response = result['choices'][0]['message']['content']
+            # Apply validation and truncation using the enhanced function
+            validated_response = validate_and_truncate_response(raw_response, transaction_id)
+            return validated_response
         else:
             raise Exception(f"API status {response.status}")
     except Exception as e:
@@ -252,12 +260,117 @@ def query_perplexity(query: str, transaction_id: str) -> str:
         })
         raise Exception(f"Perplexity error: {str(e)}")
 
+def validate_and_truncate_response(text: str, transaction_id: str) -> str:
+    """
+    Validates and optimizes response for SMS delivery:
+    - Prioritizes complete sentences over strict character limits
+    - Aims for ~400 characters but allows up to ~440 for sentence completion
+    - Ensures final sentence is always complete (never truncated mid-sentence)
+    - Maximum 5 sentences for readability
+    - Handles periods, exclamation marks, and question marks as sentence endings
+    """
+    try:
+        # First clean the response
+        cleaned_text = clean_response(text)
+        
+        # If already under limit, return as-is
+        if len(cleaned_text) <= 400:
+            return cleaned_text
+        
+        # Split into sentences - handle multiple punctuation marks
+        sentences = re.split(r'[.!?]+\s+', cleaned_text)
+        
+        # Remove empty sentences
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        # Build response sentence by sentence, prioritizing complete sentences
+        final_response = ""
+        for i, sentence in enumerate(sentences):
+            # Add proper punctuation if missing
+            if sentence and not sentence[-1] in '.!?':
+                sentence += '.'
+            
+            # Check if adding this sentence would exceed the limit
+            test_response = final_response + (' ' if final_response else '') + sentence
+            
+            # Always include the first sentence, even if it's long
+            if i == 0 or len(test_response) <= 440:  # Increased buffer to 440 for complete sentences
+                final_response = test_response
+            else:
+                # This sentence would make us exceed the reasonable limit, so stop here
+                # But we prioritize having a complete final sentence over strict character limits
+                break
+                
+            # Limit to maximum 5 sentences for SMS readability
+            if i >= 4:  # 0-indexed, so this is the 5th sentence
+                break
+        
+        # If we still have no response or it's too short, try to salvage something
+        if not final_response or len(final_response) < 20:
+            # Take first sentence and truncate it smartly if needed
+            first_sentence = sentences[0] if sentences else cleaned_text
+            if len(first_sentence) > 395:  # Leave room for period
+                # Find last complete word that fits
+                words = first_sentence.split()
+                truncated = ""
+                for word in words:
+                    test_text = truncated + (' ' if truncated else '') + word
+                    if len(test_text) <= 395:
+                        truncated = test_text
+                    else:
+                        break
+                final_response = truncated + '.'
+            else:
+                final_response = first_sentence if first_sentence.endswith(('.', '!', '?')) else first_sentence + '.'
+        
+        # Final length check and logging - more lenient for complete sentences
+        if len(final_response) > 500:  # Only apply emergency truncation if extremely long
+            logger.warning("Response significantly exceeds reasonable limit", extra={
+                "transaction_id": transaction_id,
+                "response_length": len(final_response)
+            })
+            # Emergency truncation only for extremely long responses
+            # Find last complete sentence that fits within 440 characters
+            emergency_sentences = re.split(r'[.!?]+\s+', final_response)
+            emergency_response = ""
+            for sentence in emergency_sentences:
+                if sentence and not sentence[-1] in '.!?':
+                    sentence += '.'
+                test_text = emergency_response + (' ' if emergency_response else '') + sentence
+                if len(test_text) <= 440:
+                    emergency_response = test_text
+                else:
+                    break
+            final_response = emergency_response if emergency_response else final_response[:440].rsplit(' ', 1)[0] + '.'
+        
+        sentence_count = len([s for s in re.split(r'[.!?]+\s+', final_response) if s.strip()])
+        logger.info("Response validated", extra={
+            "transaction_id": transaction_id,
+            "original_length": len(text),
+            "final_length": len(final_response),
+            "sentence_count": sentence_count
+        })
+        
+        return final_response
+        
+    except Exception as e:
+        logger.error("Error in response validation", extra={
+            "transaction_id": transaction_id,
+            "error": str(e)
+        })
+        # Return a safe fallback
+        return "Unable to process response properly."
 
 def clean_response(text: str) -> str:
+    """Enhanced response cleaning function"""
     try:
+        # Remove markdown formatting
         text = re.sub(r'[*#`_~]', '', text)
+        # Remove citations and reference markers
         text = re.sub(r'\[\d*\]', '', text)
-        return ' '.join(text.split()).strip()
+        # Remove extra whitespace
+        text = ' '.join(text.split()).strip()
+        return text
     except:
         return "Response formatting error."
 
@@ -339,16 +452,15 @@ def lambda_handler(event: dict, context):
         original_query = message_content
         try:
             perplexity_response = query_perplexity(message_content, transaction_id)
-            cleaned_response = clean_response(perplexity_response)
             logger.info("User query processed", extra={
                 "transaction_id": transaction_id,
                 "phone": sender_phone,
                 "email": user_email or "none",
                 "query": original_query,
-                "response": cleaned_response[:280],
+                "response": perplexity_response[:280],
                 "version": version
             })
-            send_sms(sender_phone, cleaned_response, destination_number, transaction_id)
+            send_sms(sender_phone, perplexity_response, destination_number, transaction_id)
             metrics.add_metric(name="SuccessfulResponses", unit=MetricUnit.Count, value=1)
             return {'statusCode': 200, 'body': 'Message processed'}
         except Exception as e:
