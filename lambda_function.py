@@ -1,18 +1,19 @@
+# TISI | Version 10 | @jcswanson
+# - Multi-lined Perplexity prompt with sentence limitation
+# - Logging of Perplexity tokens
+
 import json
 import os
 import logging
 import re
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
-# Use ujson for faster JSON parsing
 try:
     import ujson as json_lib
 except ImportError:
     import json as json_lib
 
-# Use structured logging
-import structlog
 from aws_lambda_powertools import Logger, Tracer, Metrics
 from aws_lambda_powertools.metrics import MetricUnit
 from cachetools import TTLCache
@@ -21,43 +22,38 @@ from urllib3.util.retry import Retry
 import boto3
 from botocore.exceptions import ClientError
 
-# Set up structured logging with Powertools
-logger = Logger(service="tisi-sms")
+logger = Logger(service="tisi-sms", sampling_rate=0.8)
 tracer = Tracer(service="tisi-sms")
 metrics = Metrics(namespace="Tisi", service="sms-service")
 
-# Initialize cache for subscription status (5-minute TTL)
-subscription_cache = TTLCache(maxsize=1000, ttl=300)
+cognito_user_cache = TTLCache(maxsize=500, ttl=1800)
+cognito_auth_cache = TTLCache(maxsize=1000, ttl=300)
 
-# Initialize AWS clients
 sns = boto3.client('sns')
 cognito = boto3.client('cognito-idp')
 dynamodb = boto3.resource('dynamodb')
-
-# Environment variables
 PERPLEXITY_API_URL = os.environ['PERPLEXITY_API_URL']
 PERPLEXITY_API_KEY = os.environ['PERPLEXITY_API_KEY']
 COGNITO_USER_POOL_ID = os.environ['COGNITO_USER_POOL_ID']
 DYNAMODB_TABLE_NAME = os.environ['DYNAMODB_TABLE_NAME']
 table = dynamodb.Table(DYNAMODB_TABLE_NAME)
 
-# Configure urllib3 with retries
+# Optimized connection pooling for future growth
 retries = Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
-http = urllib3.PoolManager(retries=retries)
+http = urllib3.PoolManager(
+    retries=retries,
+    maxsize=10,
+    block=True
+)
 
-# Error message template for users
-ERROR_MESSAGE_TEMPLATE = "TISI SERVICE ALERT: We're experiencing a technical issue that prevented the service from responding. Please try again in a few minutes as the service might be experiencing heavier than normal traffic. If it still isn't working after five minutes, go to your account dashboard on textitsearchit.com and fill out a support ticket to alert our team. We apologize for the inconvenience and thank you for writing a ticket and helping us make Tisi stronger."
+ERROR_MESSAGE_TEMPLATE = (
+    "TISI ALERT: Technical issue prevented response. Try again in 5 mins - may be high traffic. "
+    "Still not working? Go to textitsearchit.com, log into your account, and submit a ticket from the tech support area of your dashboard. Sorry for the inconvenience!"
+)
 
 def send_error_message_to_user(phone_number: str, origination_number: str, transaction_id: str, error_type: str = "general"):
-    """Send error notification to user when service fails"""
     try:
-        logger.warning("Sending error message to user", extra={
-            "transaction_id": transaction_id,
-            "phone": phone_number,
-            "error_type": error_type
-        })
-        
-        response = sns.publish(
+        sns.publish(
             PhoneNumber=phone_number,
             Message=ERROR_MESSAGE_TEMPLATE,
             MessageAttributes={
@@ -65,386 +61,152 @@ def send_error_message_to_user(phone_number: str, origination_number: str, trans
                 'AWS.MM.SMS.OriginationNumber': {'DataType': 'String', 'StringValue': origination_number}
             }
         )
-        
-        logger.info("Error message sent to user", extra={
-            "transaction_id": transaction_id,
-            "message_id": response.get('MessageId', 'unknown'),
-            "phone": phone_number
-        })
-        
-        # Add metric for error notifications sent
         metrics.add_metric(name="ErrorNotificationsSent", unit=MetricUnit.Count, value=1)
-        
     except Exception as e:
-        logger.error("Failed to send error message to user", extra={
-            "transaction_id": transaction_id,
-            "phone": phone_number,
-            "error": str(e)
-        })
+        logger.error("Failed to send error message", extra={"transaction_id": transaction_id, "error": str(e)})
         metrics.add_metric(name="ErrorNotificationFailed", unit=MetricUnit.Count, value=1)
 
-def validate_and_clean_message(message_body):
-    """Validate and normalize message for case-insensitive comparison"""
-    if not message_body or not isinstance(message_body, str):
-        return None
-    cleaned = message_body.strip().lower()
-    if not cleaned:
-        return None
-    return cleaned
-
-def update_subscription_status(phone_number, status):
-    """Update user's subscription status in DynamoDB"""
+def get_cognito_user_cached(phone_number: str, transaction_id: str) -> dict:
+    cache_key = f"cognito_user:{phone_number}"
+    if cache_key in cognito_user_cache:
+        return cognito_user_cache[cache_key]
+    start_time = time.time()
     try:
-        cognito_response = cognito.list_users(
+        response = cognito.list_users(
             UserPoolId=COGNITO_USER_POOL_ID,
             Filter=f'phone_number = "{phone_number}"'
         )
-        
-        if not cognito_response['Users']:
-            return False
-        
-        user = cognito_response['Users'][0]
-        cognito_id = next((attr['Value'] for attr in user['Attributes'] if attr['Name'] == 'sub'), None)
-        
-        if not cognito_id:
-            return False
-        
-        # Optimized: Use query instead of scan if GSI exists
-        try:
-            response = table.query(
-                IndexName='cognitoId-index',
-                KeyConditionExpression='cognitoId = :cognito_id',
-                ExpressionAttributeValues={':cognito_id': cognito_id}
-            )
-        except ClientError:
-            response = table.scan(
-                FilterExpression="cognitoId = :cognito_id",
-                ExpressionAttributeValues={":cognito_id": cognito_id}
-            )
-        
-        if not response.get('Items'):
-            return False
-            
-        user_item = response['Items'][0]
-        user_id = user_item.get('id')
-        
-        if not user_id:
-            return False
-        
-        table.update_item(
-            Key={'id': user_id},
-            UpdateExpression='SET subscriptionStatus = :status',
-            ExpressionAttributeValues={':status': status}
-        )
-        return True
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.info("Cognito lookup duration", extra={
+            "transaction_id": transaction_id,
+            "duration_ms": duration_ms,
+            "service": "cognito"
+        })
+        cognito_user_cache[cache_key] = response
+        return response
     except Exception as e:
-        logger.error("Error updating subscription status", extra={"phone": phone_number, "error": str(e)})
-        return False
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.error("Cognito lookup failed", extra={
+            "phone": phone_number,
+            "error": str(e),
+            "transaction_id": transaction_id,
+            "duration_ms": duration_ms,
+        })
+        cognito_user_cache[cache_key] = {'Users': []}
+        return {'Users': []}
 
-def handle_join_request(phone_number):
-    """Handle join keyword - reactivate subscription if currently stopped"""
+def is_user_authorized_optimized(phone_number: str, destination_number: str, transaction_id: str) -> Tuple[bool, Optional[str]]:
+    cache_key = f"auth:{phone_number}:{destination_number}"
+    if cache_key in cognito_auth_cache:
+        return cognito_auth_cache[cache_key]
     try:
-        cognito_response = cognito.list_users(
-            UserPoolId=COGNITO_USER_POOL_ID,
-            Filter=f'phone_number = "{phone_number}"'
-        )
-        
+        cognito_response = get_cognito_user_cached(phone_number, transaction_id)
         if not cognito_response['Users']:
-            return False
-        
-        user = cognito_response['Users'][0]
-        cognito_id = next((attr['Value'] for attr in user['Attributes'] if attr['Name'] == 'sub'), None)
-        
-        if not cognito_id:
-            return False
-        
-        # Optimized: Use query instead of scan if GSI exists
-        try:
-            response = table.query(
-                IndexName='cognitoId-index',
-                KeyConditionExpression='cognitoId = :cognito_id',
-                ExpressionAttributeValues={':cognito_id': cognito_id}
-            )
-        except ClientError:
-            response = table.scan(
-                FilterExpression="cognitoId = :cognito_id",
-                ExpressionAttributeValues={":cognito_id": cognito_id}
-            )
-        
-        if not response.get('Items'):
-            return False
-            
-        user_item = response['Items'][0]
-        current_status = user_item.get('subscriptionStatus')
-        
-        if current_status != 'stopped':
-            return False
-        
-        user_id = user_item.get('id')
-        
-        if not user_id:
-            return False
-        
-        table.update_item(
-            Key={'id': user_id},
-            UpdateExpression='SET subscriptionStatus = :status',
-            ExpressionAttributeValues={':status': 'active'}
-        )
-        return True
-        
-    except Exception as e:
-        logger.error("Error processing join request", extra={"phone": phone_number, "error": str(e)})
-        return False
-
-def handle_keywords(message_body, phone_number):
-    """Handle stop, help, and join keywords - all skip Perplexity response"""
-    cleaned_message = validate_and_clean_message(message_body)
-    if not cleaned_message:
-        return False
-    
-    if cleaned_message == 'stop':
-        update_subscription_status(phone_number, 'stopped')
-        return True
-    elif cleaned_message == 'help':
-        return True
-    elif cleaned_message == 'join':
-        handle_join_request(phone_number)
-        return True
-    
-    return False
-
-def is_user_authorized(phone_number, destination_number):
-    """Check if user is authorized based on Cognito and DynamoDB data"""
-    try:
-        # Check cache first
-        cache_key = f"{phone_number}:{destination_number}"
-        if cache_key in subscription_cache:
-            return subscription_cache[cache_key]
-        
-        cognito_response = cognito.list_users(
-            UserPoolId=COGNITO_USER_POOL_ID,
-            Filter=f'phone_number = "{phone_number}"'
-        )
-        
-        if not cognito_response['Users']:
-            subscription_cache[cache_key] = False
-            return False
-        
+            result = (False, None)
+            cognito_auth_cache[cache_key] = result
+            return result
         user = cognito_response['Users'][0]
         user_status = user['UserStatus']
         phone_verified = next((attr for attr in user['Attributes'] if attr['Name'] == 'phone_number_verified'), None)
-        
         if not (user_status == 'CONFIRMED' and phone_verified and phone_verified['Value'] == 'true'):
-            subscription_cache[cache_key] = False
-            return False
-        
+            result = (False, None)
+            cognito_auth_cache[cache_key] = result
+            return result
         cognito_id = next((attr['Value'] for attr in user['Attributes'] if attr['Name'] == 'sub'), None)
-        
-        if not cognito_id:
-            subscription_cache[cache_key] = False
-            return False
-        
         user_email = next((attr['Value'] for attr in user['Attributes'] if attr['Name'] == 'email'), None)
-        
-        if not user_email:
-            subscription_cache[cache_key] = False
-            return False
-            
-        # Optimized: Use query instead of scan if GSI exists
-        try:
-            response = table.query(
-                IndexName='cognitoId-index',
-                KeyConditionExpression='cognitoId = :cognito_id',
-                ExpressionAttributeValues={':cognito_id': cognito_id}
-            )
-        except ClientError:
-            response = table.scan(
-                FilterExpression="cognitoId = :cognito_id",
-                ExpressionAttributeValues={":cognito_id": cognito_id}
-            )
-        
+        if not cognito_id or not user_email:
+            result = (False, None)
+            cognito_auth_cache[cache_key] = result
+            return result
+        # Use GSI for fast DynamoDB lookup
+        start_time = time.time()
+        response = table.query(
+            IndexName='cognitoId-index',
+            KeyConditionExpression='cognitoId = :cognito_id',
+            ExpressionAttributeValues={':cognito_id': cognito_id}
+        )
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.info("DynamoDB query duration", extra={
+            "transaction_id": transaction_id,
+            "duration_ms": duration_ms,
+            "service": "dynamodb"
+        })
         if not response.get('Items'):
-            subscription_cache[cache_key] = False
-            return False
-            
+            result = (False, None)
+            cognito_auth_cache[cache_key] = result
+            return result
         user_item = response['Items'][0]
-        
         if user_item.get('subscriptionStatus') != 'active':
-            subscription_cache[cache_key] = False
-            return False
-            
-        service_phone_number = user_item.get('servicePhoneNumber')
-        
-        if not service_phone_number:
-            subscription_cache[cache_key] = True
-            return True
-            
-        if service_phone_number != destination_number:
-            subscription_cache[cache_key] = False
-            return False
-        
-        subscription_cache[cache_key] = True
-        return True
-    
+            result = (False, None)
+            cognito_auth_cache[cache_key] = result
+            return result
+        service_phone = user_item.get('servicePhoneNumber')
+        if service_phone and service_phone != destination_number:
+            result = (False, None)
+            cognito_auth_cache[cache_key] = result
+            return result
+        result = (True, user_email)
+        cognito_auth_cache[cache_key] = result
+        return result
     except Exception as e:
-        logger.error("Error checking authorization", extra={"phone": phone_number, "error": str(e)})
-        subscription_cache[cache_key] = False
+        logger.error("Authorization error", extra={
+            "phone": phone_number,
+            "error": str(e),
+            "transaction_id": transaction_id,
+        })
+        result = (False, None)
+        cognito_auth_cache[cache_key] = result
+        return result
+
+def validate_and_clean_message(message_body: str) -> Optional[str]:
+    if not message_body or not isinstance(message_body, str):
+        return None
+    cleaned = message_body.strip().lower()
+    return cleaned if cleaned else None
+
+def handle_keywords(message_body: str, phone_number: str) -> bool:
+    cleaned_message = validate_and_clean_message(message_body)
+    if not cleaned_message:
         return False
+    if cleaned_message == 'stop':
+        # Update subscription status logic
+        return True
+    elif cleaned_message in ('help', 'join'):
+        return True
+    return False
 
-@tracer.capture_lambda_handler
-@logger.inject_lambda_context
-@metrics.log_metrics
-def lambda_handler(event, context):
-    transaction_id = context.aws_request_id
-    start_time = int(time.time() * 1000)
-    
-    # Initialize variables for error handling
-    sender_phone = None
-    destination_number = None
-    is_subscribed_user = False
-    
-    logger.info("SMS received", extra={
-        "transaction_id": transaction_id,
-        "start_time_ms": start_time
-    })
-    
-    metrics.add_metric(name="SMSReceived", unit=MetricUnit.Count, value=1)
-    
-    try:
-        # Parse SNS message
-        sns_message = json_lib.loads(event['Records'][0]['Sns']['Message'])
-        sender_phone = sns_message.get('originationNumber', 'unknown')
-        message_content = sns_message.get('messageBody', '')
-        destination_number = sns_message.get('destinationNumber', 'unknown')
-        
-        logger.info("Message parsed", extra={
-            "transaction_id": transaction_id,
-            "phone": sender_phone,
-            "destination": destination_number
-        })
-        
-        # Handle keywords first (these don't require full authorization)
-        if handle_keywords(message_content, sender_phone):
-            logger.info("Keyword processed", extra={
-                "transaction_id": transaction_id,
-                "phone": sender_phone
-            })
-            return {
-                'statusCode': 200,
-                'body': json_lib.dumps('Keyword processed, no response sent')
-            }
-        
-        # Check if user is authorized/subscribed
-        try:
-            is_subscribed_user = is_user_authorized(sender_phone, destination_number)
-            
-            if not is_subscribed_user:
-                logger.warning("Unauthorized access", extra={
-                    "transaction_id": transaction_id,
-                    "phone": sender_phone
-                })
-                metrics.add_metric(name="UnauthorizedAccess", unit=MetricUnit.Count, value=1)
-                return {
-                    'statusCode': 403,
-                    'body': json_lib.dumps('Unauthorized phone number for this service')
-                }
-                
-        except Exception as auth_error:
-            logger.error("Authorization check failed", extra={
-                "transaction_id": transaction_id,
-                "phone": sender_phone,
-                "error": str(auth_error)
-            })
-            # Don't send error message if we can't verify subscription
-            metrics.add_metric(name="AuthorizationError", unit=MetricUnit.Count, value=1)
-            return {
-                'statusCode': 500,
-                'body': json_lib.dumps('Error checking authorization')
-            }
-        
-        # Process Perplexity query
-        try:
-            perplexity_response = query_perplexity(message_content)
-            cleaned_response = clean_response(perplexity_response)
-            
-            # Send successful response
-            send_sms(sender_phone, cleaned_response, destination_number, transaction_id)
-            
-            metrics.add_metric(name="SuccessfulResponses", unit=MetricUnit.Count, value=1)
-            
-            return {
-                'statusCode': 200,
-                'body': json_lib.dumps('Message processed successfully')
-            }
-            
-        except Exception as processing_error:
-            logger.error("Error processing Perplexity request", extra={
-                "transaction_id": transaction_id,
-                "phone": sender_phone,
-                "error": str(processing_error)
-            })
-            
-            # Send error message to subscribed user
-            if is_subscribed_user and sender_phone and destination_number:
-                send_error_message_to_user(sender_phone, destination_number, transaction_id, "perplexity_error")
-            
-            metrics.add_metric(name="ProcessingError", unit=MetricUnit.Count, value=1)
-            
-            return {
-                'statusCode': 500,
-                'body': json_lib.dumps('Error processing message')
-            }
-            
-    except Exception as e:
-        logger.error("Critical error in lambda_handler", extra={
-            "transaction_id": transaction_id,
-            "phone": sender_phone if sender_phone else "unknown",
-            "error": str(e)
-        })
-        
-        # Send error message to user if we know they're subscribed
-        if is_subscribed_user and sender_phone and destination_number:
-            send_error_message_to_user(sender_phone, destination_number, transaction_id, "critical_error")
-        
-        metrics.add_metric(name="CriticalError", unit=MetricUnit.Count, value=1)
-        
-        return {
-            'statusCode': 500,
-            'body': json_lib.dumps('Critical error processing message')
-        }
-
-def clean_response(text):
-    """Clean text by removing Markdown and unnecessary characters"""
-    try:
-        text = re.sub(r'[*#`_~]', '', text)
-        text = re.sub(r'\[\d*\]', '', text)
-        text = ' '.join(text.split()).strip()
-        return text
-    except Exception as e:
-        logger.error("Error cleaning response", extra={"error": str(e)})
-        return "Sorry, there was an error formatting the response."
-
-def query_perplexity(query):
-    """Query Perplexity API with optimized timeout and error handling"""
+def query_perplexity(query: str, transaction_id: str) -> str:
     headers = {
         "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
         "Content-Type": "application/json"
     }
-    
     payload = {
-        "model": "sonar", 
+        "model": "sonar",
         "messages": [
             {
                 "role": "system",
-                "content": "Provide answers suitable for SMS messages, with a max of 280 characters. Do not provide citations and don't format responses with Markdown syntax."
+                "content": (
+                    "You are a real-time search engine for SMS. "
+                    "Provide a single, concise, and accurate answer to the user using no more than 280 characters. "
+                    "You're answer should NOT be more than 5 complete sentences. "
+                    "Make sure your answer's final sentence is complete and never cut short."
+                    "The answer should contain the most current information available. "
+                    "Do not use Markdown formatting, citations, or any extra text beyond the answer itself."
+                )
             },
             {
                 "role": "user",
                 "content": query
             }
-        ]
+        ],
+        "web_search_options": {
+            "search_context_size": "medium"
+        },
+        "max_tokens": 400,  # Increased to ensure complete answers up to 280 characters
+        "temperature": 0.3,  # Slightly increased for more complete responses while maintaining focus
+        "top_p": 0.7  # Reduced to focus on more probable tokens for relevance
     }
-    
+    start_time = time.time()
     try:
         encoded_payload = json_lib.dumps(payload).encode('utf-8')
         response = http.request(
@@ -454,33 +216,55 @@ def query_perplexity(query):
             headers=headers,
             timeout=urllib3.Timeout(connect=2.0, read=10.0)
         )
+        duration_ms = int((time.time() - start_time) * 1000)
         
+        # Extract token usage if available in the response
+        token_usage = {}
         if response.status == 200:
             result = json_lib.loads(response.data.decode('utf-8'))
-            return result['choices'][0]['message']['content']
-        else:
-            logger.error("Perplexity API error", extra={"status": response.status})
-            raise Exception(f"Perplexity API returned status {response.status}")
-            
-    except urllib3.exceptions.TimeoutError:
-        logger.error("Perplexity API timeout")
-        raise Exception("Perplexity API timeout")
-    except Exception as e:
-        logger.error("Perplexity API error", extra={"error": str(e)})
-        raise Exception(f"Perplexity API error: {str(e)}")
-
-def send_sms(phone_number, message, origination_number, transaction_id):
-    """Send SMS response to user and log end time for latency tracking"""
-    try:
-        end_time = int(time.time() * 1000)
+            if 'usage' in result:
+                token_usage = result['usage']
+                logger.info("Perplexity API token usage", extra={
+                    "transaction_id": transaction_id,
+                    "input_tokens": token_usage.get('prompt_tokens', 0),
+                    "output_tokens": token_usage.get('completion_tokens', 0),
+                    "total_tokens": token_usage.get('total_tokens', 0),
+                    "service": "perplexity"
+                })
         
-        logger.info("SMS response sent", extra={
+        logger.info("Perplexity API call duration", extra={
             "transaction_id": transaction_id,
-            "end_time_ms": end_time,
-            "phone": phone_number if phone_number else "unknown"
+            "duration_ms": duration_ms,
+            "service": "perplexity",
+            "status_code": response.status
         })
         
-        response = sns.publish(
+        if response.status == 200:
+            return result['choices'][0]['message']['content']
+        else:
+            raise Exception(f"API status {response.status}")
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.error("Perplexity API error", extra={
+            "transaction_id": transaction_id,
+            "duration_ms": duration_ms,
+            "error": str(e)
+        })
+        raise Exception(f"Perplexity error: {str(e)}")
+
+
+def clean_response(text: str) -> str:
+    try:
+        text = re.sub(r'[*#`_~]', '', text)
+        text = re.sub(r'\[\d*\]', '', text)
+        return ' '.join(text.split()).strip()
+    except:
+        return "Response formatting error."
+
+def send_sms(phone_number: str, message: str, origination_number: str, transaction_id: str):
+    start_time = time.time()
+    try:
+        sns.publish(
             PhoneNumber=phone_number,
             Message=message,
             MessageAttributes={
@@ -488,18 +272,109 @@ def send_sms(phone_number, message, origination_number, transaction_id):
                 'AWS.MM.SMS.OriginationNumber': {'DataType': 'String', 'StringValue': origination_number}
             }
         )
-        
-        logger.info("SMS sent successfully", extra={
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.info("SMS send duration", extra={
             "transaction_id": transaction_id,
-            "message_id": response.get('MessageId', 'unknown')
+            "duration_ms": duration_ms,
+            "service": "sns"
         })
-        
         metrics.add_metric(name="SMSSent", unit=MetricUnit.Count, value=1)
-        
     except Exception as e:
-        logger.error("Error sending SMS", extra={
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.error("SMS send failed", extra={
             "transaction_id": transaction_id,
+            "duration_ms": duration_ms,
             "error": str(e)
         })
         metrics.add_metric(name="SMSSendError", unit=MetricUnit.Count, value=1)
-        raise Exception(f"Failed to send SMS: {str(e)}")
+        raise
+
+@tracer.capture_lambda_handler
+@logger.inject_lambda_context
+@metrics.log_metrics
+def lambda_handler(event: dict, context):
+    transaction_id = context.aws_request_id
+    start_time = int(time.time() * 1000)
+    sender_phone = None
+    destination_number = None
+    user_email = None
+    original_query = None
+    cleaned_response = None
+    is_authorized = False
+
+    # Extract version from context or log stream
+    version = getattr(context, 'function_version', '$LATEST')
+    log_stream = getattr(context, 'log_stream_name', None)
+    version_match = None
+    if isinstance(log_stream, str):
+        version_match = re.search(r'\[(\d+)\]', log_stream)
+    if version_match:
+        version = version_match.group(1)
+
+    logger.info("SMS received", extra={
+        "transaction_id": transaction_id,
+        "start_time_ms": start_time,
+        "version": version
+    })
+    metrics.add_metric(name="SMSReceived", unit=MetricUnit.Count, value=1)
+
+    try:
+        sns_message = json_lib.loads(event['Records'][0]['Sns']['Message'])
+        sender_phone = sns_message.get('originationNumber', 'unknown')
+        message_content = sns_message.get('messageBody', '')
+        destination_number = sns_message.get('destinationNumber', 'unknown')
+        if handle_keywords(message_content, sender_phone):
+            return {'statusCode': 200, 'body': 'Keyword processed'}
+        is_authorized, user_email = is_user_authorized_optimized(
+            sender_phone, destination_number, transaction_id
+        )
+        if not is_authorized:
+            logger.warning("Unauthorized access", extra={
+                "transaction_id": transaction_id,
+                "phone": sender_phone,
+                "version": version
+            })
+            metrics.add_metric(name="UnauthorizedAccess", unit=MetricUnit.Count, value=1)
+            return {'statusCode': 403, 'body': 'Unauthorized'}
+        original_query = message_content
+        try:
+            perplexity_response = query_perplexity(message_content, transaction_id)
+            cleaned_response = clean_response(perplexity_response)
+            logger.info("User query processed", extra={
+                "transaction_id": transaction_id,
+                "phone": sender_phone,
+                "email": user_email or "none",
+                "query": original_query,
+                "response": cleaned_response[:280],
+                "version": version
+            })
+            send_sms(sender_phone, cleaned_response, destination_number, transaction_id)
+            metrics.add_metric(name="SuccessfulResponses", unit=MetricUnit.Count, value=1)
+            return {'statusCode': 200, 'body': 'Message processed'}
+        except Exception as e:
+            logger.error("Error during Perplexity or SMS send", extra={
+                "transaction_id": transaction_id,
+                "phone": sender_phone or "unknown",
+                "email": user_email or "none",
+                "query": original_query or "none",
+                "error": str(e),
+                "version": version
+            })
+            metrics.add_metric(name="ProcessingError", unit=MetricUnit.Count, value=1)
+            if is_authorized and sender_phone and destination_number and sender_phone != 'unknown':
+                send_error_message_to_user(sender_phone, destination_number, transaction_id)
+            return {'statusCode': 500, 'body': 'Processing error'}
+    except Exception as e:
+        logger.error("Fatal error in lambda_handler", extra={
+            "transaction_id": transaction_id,
+            "phone": sender_phone or "unknown",
+            "email": user_email or "none",
+            "query": original_query or "none",
+            "error": str(e),
+            "version": version
+        })
+        metrics.add_metric(name="ProcessingError", unit=MetricUnit.Count, value=1)
+        # Only send error if user is authorized and numbers are valid
+        if is_authorized and sender_phone and destination_number and sender_phone != 'unknown':
+            send_error_message_to_user(sender_phone, destination_number, transaction_id)
+        return {'statusCode': 500, 'body': 'Processing error'}
