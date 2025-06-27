@@ -1,6 +1,5 @@
-# Text It Search It | Version 11 | jcswanson
-# - New Perplexity prompt with Sentence truncation to avoid cut off sentences
-# - Same method from Demo on the website
+# Text It Search It | Version 12 | @jcswanson
+# - Removed Cognito authentication, replaced with DynamoDB auth only
 
 import json
 import os
@@ -8,12 +7,10 @@ import logging
 import re
 import time
 from typing import Optional, Tuple
-
 try:
     import ujson as json_lib
 except ImportError:
     import json as json_lib
-
 from aws_lambda_powertools import Logger, Tracer, Metrics
 from aws_lambda_powertools.metrics import MetricUnit
 from cachetools import TTLCache
@@ -26,15 +23,16 @@ logger = Logger(service="tisi-sms", sampling_rate=0.8)
 tracer = Tracer(service="tisi-sms")
 metrics = Metrics(namespace="Tisi", service="sms-service")
 
-cognito_user_cache = TTLCache(maxsize=500, ttl=1800)
-cognito_auth_cache = TTLCache(maxsize=1000, ttl=300)
+# cognito_user_cache = TTLCache(maxsize=500, ttl=1800)
+# Update this line near the top of your file
+dynamodb_auth_cache = TTLCache(maxsize=1000, ttl=900)
 
-sns = boto3.client('sns')
-cognito = boto3.client('cognito-idp')
 dynamodb = boto3.resource('dynamodb')
+sns = boto3.client('sns')
+# cognito = boto3.client('cognito-idp')
+# COGNITO_USER_POOL_ID = os.environ['COGNITO_USER_POOL_ID']
 PERPLEXITY_API_URL = os.environ['PERPLEXITY_API_URL']
 PERPLEXITY_API_KEY = os.environ['PERPLEXITY_API_KEY']
-COGNITO_USER_POOL_ID = os.environ['COGNITO_USER_POOL_ID']
 DYNAMODB_TABLE_NAME = os.environ['DYNAMODB_TABLE_NAME']
 table = dynamodb.Table(DYNAMODB_TABLE_NAME)
 
@@ -66,97 +64,119 @@ def send_error_message_to_user(phone_number: str, origination_number: str, trans
         logger.error("Failed to send error message", extra={"transaction_id": transaction_id, "error": str(e)})
         metrics.add_metric(name="ErrorNotificationFailed", unit=MetricUnit.Count, value=1)
 
-def get_cognito_user_cached(phone_number: str, transaction_id: str) -> dict:
-    cache_key = f"cognito_user:{phone_number}"
-    if cache_key in cognito_user_cache:
-        return cognito_user_cache[cache_key]
-    start_time = time.time()
-    try:
-        response = cognito.list_users(
-            UserPoolId=COGNITO_USER_POOL_ID,
-            Filter=f'phone_number = "{phone_number}"'
-        )
-        duration_ms = int((time.time() - start_time) * 1000)
-        logger.info("Cognito lookup duration", extra={
-            "transaction_id": transaction_id,
-            "duration_ms": duration_ms,
-            "service": "cognito"
-        })
-        cognito_user_cache[cache_key] = response
-        return response
-    except Exception as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        logger.error("Cognito lookup failed", extra={
-            "phone": phone_number,
-            "error": str(e),
-            "transaction_id": transaction_id,
-            "duration_ms": duration_ms,
-        })
-        cognito_user_cache[cache_key] = {'Users': []}
-        return {'Users': []}
+# INCLUDED IN VERSION 11
+# def get_cognito_user_cached(phone_number: str, transaction_id: str) -> dict:
+#     cache_key = f"cognito_user:{phone_number}"
+#     if cache_key in cognito_user_cache:
+#         return cognito_user_cache[cache_key]
+#     start_time = time.time()
+#     try:
+#         response = cognito.list_users(
+#             UserPoolId=COGNITO_USER_POOL_ID,
+#             Filter=f'phone_number = "{phone_number}"'
+#         )
+#         duration_ms = int((time.time() - start_time) * 1000)
+#         logger.info("Cognito lookup duration", extra={
+#             "transaction_id": transaction_id,
+#             "duration_ms": duration_ms,
+#             "service": "cognito"
+#         })
+#         cognito_user_cache[cache_key] = response
+#         return response
+#     except Exception as e:
+#         duration_ms = int((time.time() - start_time) * 1000)
+#         logger.error("Cognito lookup failed", extra={
+#             "phone": phone_number,
+#             "error": str(e),
+#             "transaction_id": transaction_id,
+#             "duration_ms": duration_ms,
+#         })
+#         cognito_user_cache[cache_key] = {'Users': []}
+#         return {'Users': []}
 
-def is_user_authorized_optimized(phone_number: str, destination_number: str, transaction_id: str) -> Tuple[bool, Optional[str]]:
-    cache_key = f"auth:{phone_number}:{destination_number}"
-    if cache_key in cognito_auth_cache:
-        return cognito_auth_cache[cache_key]
+def is_user_authorized_dynamodb_only(phone_number: str, destination_number: str, transaction_id: str) -> Tuple[bool, Optional[str]]:
+    """Streamlined authorization using only DynamoDB for maximum performance"""
+    cache_key = f"auth_ddb:{phone_number}:{destination_number}"
+    
+    # Check cache first - increased TTL since we're eliminating slower Cognito calls
+    if cache_key in dynamodb_auth_cache:
+        return dynamodb_auth_cache[cache_key]
+    
     try:
-        cognito_response = get_cognito_user_cached(phone_number, transaction_id)
-        if not cognito_response['Users']:
-            result = (False, None)
-            cognito_auth_cache[cache_key] = result
-            return result
-        user = cognito_response['Users'][0]
-        user_status = user['UserStatus']
-        phone_verified = next((attr for attr in user['Attributes'] if attr['Name'] == 'phone_number_verified'), None)
-        if not (user_status == 'CONFIRMED' and phone_verified and phone_verified['Value'] == 'true'):
-            result = (False, None)
-            cognito_auth_cache[cache_key] = result
-            return result
-        cognito_id = next((attr['Value'] for attr in user['Attributes'] if attr['Name'] == 'sub'), None)
-        user_email = next((attr['Value'] for attr in user['Attributes'] if attr['Name'] == 'email'), None)
-        if not cognito_id or not user_email:
-            result = (False, None)
-            cognito_auth_cache[cache_key] = result
-            return result
-        # Use GSI for fast DynamoDB lookup
         start_time = time.time()
+        
+        # Direct DynamoDB query by phone number using the new GSI
         response = table.query(
-            IndexName='cognitoId-index',
-            KeyConditionExpression='cognitoId = :cognito_id',
-            ExpressionAttributeValues={':cognito_id': cognito_id}
+            IndexName='phoneNumber-index',
+            KeyConditionExpression='phoneNumber = :phone',
+            ExpressionAttributeValues={':phone': phone_number}
         )
+        
         duration_ms = int((time.time() - start_time) * 1000)
-        logger.info("DynamoDB query duration", extra={
+        logger.info("DynamoDB auth query duration", extra={
             "transaction_id": transaction_id,
             "duration_ms": duration_ms,
-            "service": "dynamodb"
+            "service": "dynamodb_auth"
         })
+        
+        # Check if user exists
         if not response.get('Items'):
             result = (False, None)
-            cognito_auth_cache[cache_key] = result
+            dynamodb_auth_cache[cache_key] = result
             return result
+            
         user_item = response['Items'][0]
-        if user_item.get('subscriptionStatus') != 'active':
+        
+        # Check subscription status
+        subscription_status = user_item.get('subscriptionStatus')
+        if subscription_status != 'active':
+            logger.info("User subscription not active", extra={
+                "transaction_id": transaction_id,
+                "phone": phone_number,
+                "status": subscription_status
+            })
             result = (False, None)
-            cognito_auth_cache[cache_key] = result
+            dynamodb_auth_cache[cache_key] = result
             return result
+        
+        # Check service phone number if set
         service_phone = user_item.get('servicePhoneNumber')
         if service_phone and service_phone != destination_number:
+            logger.warning("Service phone mismatch", extra={
+                "transaction_id": transaction_id,
+                "phone": phone_number,
+                "expected": service_phone,
+                "received": destination_number
+            })
             result = (False, None)
-            cognito_auth_cache[cache_key] = result
+            dynamodb_auth_cache[cache_key] = result
             return result
+        
+        # Get user email for logging
+        user_email = user_item.get('email', 'unknown')
+        
+        # Success - cache and return
         result = (True, user_email)
-        cognito_auth_cache[cache_key] = result
+        dynamodb_auth_cache[cache_key] = result
+        
+        logger.info("User authorized successfully", extra={
+            "transaction_id": transaction_id,
+            "phone": phone_number,
+            "email": user_email
+        })
+        
         return result
+        
     except Exception as e:
-        logger.error("Authorization error", extra={
+        logger.error("DynamoDB authorization error", extra={
             "phone": phone_number,
             "error": str(e),
             "transaction_id": transaction_id,
         })
         result = (False, None)
-        cognito_auth_cache[cache_key] = result
+        dynamodb_auth_cache[cache_key] = result
         return result
+
 
 def validate_and_clean_message(message_body: str) -> Optional[str]:
     if not message_body or not isinstance(message_body, str):
@@ -438,9 +458,16 @@ def lambda_handler(event: dict, context):
         destination_number = sns_message.get('destinationNumber', 'unknown')
         if handle_keywords(message_content, sender_phone):
             return {'statusCode': 200, 'body': 'Keyword processed'}
-        is_authorized, user_email = is_user_authorized_optimized(
+        # VERSION 11 CODE: Replace this line:
+        # is_authorized, user_email = is_user_authorized_optimized(
+        #     sender_phone, destination_number, transaction_id
+        # )
+
+        # With this:
+        is_authorized, user_email = is_user_authorized_dynamodb_only(
             sender_phone, destination_number, transaction_id
         )
+
         if not is_authorized:
             logger.warning("Unauthorized access", extra={
                 "transaction_id": transaction_id,
